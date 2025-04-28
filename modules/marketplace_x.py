@@ -3,11 +3,87 @@ import re
 import json
 import datetime
 import traceback
-import requests
 import time
 import urllib.request
 import shutil
+import sys
+import subprocess
 from urllib.error import URLError, HTTPError
+from PyQt6.QtCore import QThread, pyqtSignal, QTimer
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
+                           QLabel, QProgressBar, QFileDialog, QLineEdit, 
+                           QTextEdit, QMessageBox, QGroupBox, QApplication)
+from PIL import Image, ImageOps
+import numpy as np
+import imagehash
+import cv2
+
+# Define required packages
+required_packages = {
+    "requests": "requests",
+    "PyQt6": "PyQt6",
+    "PIL": "Pillow",
+    "numpy": "numpy",
+    "imagehash": "imagehash",
+    "cv2": "opencv-python",
+    "pandas": "pandas",
+    "openpyxl": "openpyxl"
+}
+
+def install_dependencies():
+    """Install all required dependencies using pip"""
+    missing_packages = []
+    
+    # Check which packages are missing
+    for package, pip_name in required_packages.items():
+        try:
+            __import__(package)
+            print(f"✓ {package} is already installed")
+        except ImportError:
+            missing_packages.append(pip_name)
+            print(f"✗ {package} is missing")
+    
+    # If there are missing packages, install them
+    if missing_packages:
+        print("\nInstalling missing dependencies...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install"] + missing_packages)
+            print("\nAll dependencies installed successfully!")
+            print("Please restart the application for changes to take effect.")
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"\nError installing dependencies: {e}")
+            print("\nPlease try installing them manually using:")
+            print(f"pip install {' '.join(missing_packages)}")
+            return False
+    else:
+        print("\nAll dependencies are already installed!")
+        return True
+
+# Check if script is being run with the intention to install dependencies
+if len(sys.argv) > 1 and sys.argv[1] == "install_dependencies":
+    success = install_dependencies()
+    sys.exit(0 if success else 1)
+
+# Check for required external dependencies
+missing_packages = []
+for package, pip_name in required_packages.items():
+    try:
+        __import__(package)
+    except ImportError:
+        missing_packages.append(pip_name)
+
+# If any packages are missing, show error and exit
+if missing_packages:
+    print("ERROR: Missing required dependencies")
+    print("Please install the following packages using pip:")
+    print(f"pip install {' '.join(missing_packages)}")
+    print("\nOr run this script with the install_dependencies argument:")
+    print(f"python {os.path.basename(__file__)} install_dependencies")
+    sys.exit(1)
+
+# Import external dependencies after checking
+import requests
 from PyQt6.QtCore import QThread, pyqtSignal, QTimer
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
                            QLabel, QProgressBar, QFileDialog, QLineEdit, 
