@@ -128,9 +128,14 @@ class ImageDownloaderThread(QThread):
             color = url_info.get("color", "")
             position = url_info.get("position", "")
             
+            # Skip empty URLs or SVS
             if not url or not svs:
                 continue
-                
+            
+            # Handle "nan" values that come from pandas missing data
+            if color in ["nan", "None", "NaN"] or not color:
+                color = ""
+            
             try:
                 # Construct filename based on available data
                 if color and position:
@@ -690,62 +695,86 @@ class MarketplaceXWidget(QWidget):
                               "Please process an Excel file first.")
             return
         
-        # Create a list of all URLs to download
-        download_urls = []
+        # Create download folder
+        download_folder = os.path.join(self.output_folder, "download_for_check")
+        os.makedirs(download_folder, exist_ok=True)
         
-        # Include all URLs from the data, including A1-A4 positions
-        for item in self.url_data:
-            svs = item.get("svs", "")
-            color = item.get("color", "")
-            main_url = item.get("url", "")
+        try:
+            # Read URLs from Excel file
+            import pandas as pd
+            df = pd.read_excel(self.excel_path)
             
-            # Add main URL (typically for position A1)
-            if main_url:
-                download_urls.append({
-                    "url": main_url,
-                    "svs": svs,
-                    "color": color,
-                    "position": "A1"  # Default position for main URL
-                })
+            # Create a list of all URLs to download
+            download_urls = []
             
-            # Also check for individual position URLs (A1, A2, A3, A4)
-            for pos in ["A1", "A2", "A3", "A4"]:
-                pos_key = f"url_{pos.lower()}"
-                pos_url = item.get(pos_key, "")
+            # Check which columns exist in the dataframe
+            url_columns = [col for col in df.columns if 'URL' in col or 'url' in col or col.startswith('A')]
+            
+            # Process each row in the Excel file
+            for _, row in df.iterrows():
+                svs = str(row.get("SVS", ""))
+                color = str(row.get("Color", ""))
                 
-                if pos_url and pos_url != main_url:  # Avoid duplicating the main URL
+                # Add Feature Image URL if it exists
+                if "Feature_Image_URL" in df.columns and pd.notna(row["Feature_Image_URL"]):
                     download_urls.append({
-                        "url": pos_url,
+                        "url": row["Feature_Image_URL"],
                         "svs": svs,
                         "color": color,
-                        "position": pos
+                        "position": ""
                     })
-        
-        if not download_urls:
-            QMessageBox.warning(self, "No URLs", "No valid URLs found for download!")
-            return
-        
-        self.add_log(f"Found {len(download_urls)} URLs to download")
-        
-        # Start download thread
-        self.downloader_thread = ImageDownloaderThread(download_urls, self.output_folder)
-        
-        # Connect signals
-        self.downloader_thread.progress_update.connect(self.progress_bar.setValue)
-        self.downloader_thread.log_message.connect(self.add_log)
-        self.downloader_thread.download_complete.connect(self.on_download_complete)
-        
-        # Update UI
-        self.progress_bar.setValue(0)
-        self.status_text.setText("Downloading images...")
-        
-        # Disable buttons
-        self.process_button.setEnabled(False)
-        self.download_button.setEnabled(False)
-        self.compare_button.setEnabled(False)
-        
-        # Start thread
-        self.downloader_thread.start()
+                
+                # Add C-Image URL if it exists
+                if "C-Image_URL" in df.columns and pd.notna(row["C-Image_URL"]):
+                    download_urls.append({
+                        "url": row["C-Image_URL"],
+                        "svs": svs,
+                        "color": color,
+                        "position": ""
+                    })
+                
+                # Add angle URLs (A1-A20)
+                for angle_num in range(1, 21):
+                    angle = f"A{angle_num}"
+                    if angle in df.columns and pd.notna(row[angle]):
+                        download_urls.append({
+                            "url": row[angle],
+                            "svs": svs,
+                            "color": color,
+                            "position": angle
+                        })
+            
+            if not download_urls:
+                QMessageBox.warning(self, "No URLs", "No valid URLs found for download!")
+                return
+            
+            self.add_log(f"Found {len(download_urls)} URLs to download")
+            
+            # Start download thread
+            self.downloader_thread = ImageDownloaderThread(download_urls, self.output_folder)
+            
+            # Connect signals
+            self.downloader_thread.progress_update.connect(self.progress_bar.setValue)
+            self.downloader_thread.log_message.connect(self.add_log)
+            self.downloader_thread.download_complete.connect(self.on_download_complete)
+            
+            # Update UI
+            self.progress_bar.setValue(0)
+            self.status_text.setText("Downloading images...")
+            
+            # Disable buttons
+            self.process_button.setEnabled(False)
+            self.download_button.setEnabled(False)
+            self.compare_button.setEnabled(False)
+            self.cancel_button.setEnabled(True)
+            
+            # Start thread
+            self.downloader_thread.start()
+            
+        except Exception as e:
+            self.add_log(f"Error setting up download: {str(e)}")
+            self.add_log(traceback.format_exc())
+            QMessageBox.critical(self, "Error", f"An error occurred:\n{str(e)}")
     
     def on_download_complete(self):
         """Handle completion of image download"""
