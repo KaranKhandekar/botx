@@ -124,12 +124,12 @@ class ImageDownloaderThread(QThread):
             
             # Get data from URL info
             url = url_info["url"]
-            svs = url_info.get("svs", "")
+            svs = url_info.get("svs", "").zfill(13)  # Ensure 13 digits with leading zeros
             color = url_info.get("color", "")
             position = url_info.get("position", "")
             
             # Skip empty URLs or SVS
-            if not url or not svs:
+            if not url or not svs or svs == "0" * 13:
                 continue
             
             # Handle "nan" values that come from pandas missing data
@@ -224,6 +224,26 @@ class ImageComparisonThread(QThread):
             self.log_message.emit(f"Error in histogram comparison: {str(e)}")
             self.log_message.emit(traceback.format_exc())
             return 0
+    
+    def compare_image_hashes(self, img1_path, img2_path):
+        """Compare two images using perceptual hashing"""
+        try:
+            # Open images
+            img1 = Image.open(img1_path)
+            img2 = Image.open(img2_path)
+            
+            # Calculate perceptual hashes
+            hash1 = imagehash.average_hash(img1)
+            hash2 = imagehash.average_hash(img2)
+            
+            # Calculate hash difference
+            hash_diff = hash1 - hash2
+            
+            return hash_diff
+        
+        except Exception as e:
+            self.log_message.emit(f"Error in hash comparison: {str(e)}")
+            return None
     
     def run(self):
         """Run the comparison task"""
@@ -712,14 +732,19 @@ class MarketplaceXWidget(QWidget):
             
             # Process each row in the Excel file
             for _, row in df.iterrows():
-                svs = str(row.get("SVS", ""))
+                # Ensure SVS is a 13-digit string with leading zeros
+                svs = str(row.get("SVS", "")).zfill(13)
                 color = str(row.get("Color", ""))
+                
+                # Skip empty SVS
+                if not svs or svs == "0" * 13:
+                    continue
                 
                 # Add Feature Image URL if it exists
                 if "Feature_Image_URL" in df.columns and pd.notna(row["Feature_Image_URL"]):
                     download_urls.append({
                         "url": row["Feature_Image_URL"],
-                        "svs": svs,
+                        "svs": svs,  # Now properly formatted
                         "color": color,
                         "position": ""
                     })
@@ -728,7 +753,7 @@ class MarketplaceXWidget(QWidget):
                 if "C-Image_URL" in df.columns and pd.notna(row["C-Image_URL"]):
                     download_urls.append({
                         "url": row["C-Image_URL"],
-                        "svs": svs,
+                        "svs": svs,  # Now properly formatted
                         "color": color,
                         "position": ""
                     })
@@ -739,7 +764,7 @@ class MarketplaceXWidget(QWidget):
                     if angle in df.columns and pd.notna(row[angle]):
                         download_urls.append({
                             "url": row[angle],
-                            "svs": svs,
+                            "svs": svs,  # Now properly formatted
                             "color": color,
                             "position": angle
                         })
@@ -794,7 +819,7 @@ class MarketplaceXWidget(QWidget):
         )
     
     def on_compare(self):
-        """Compare downloaded images with input images - simple approach"""
+        """Compare downloaded images with input images using perceptual hashing"""
         # Validate inputs
         if not self.input_folder:
             QMessageBox.warning(self, "Input Required", "Please select an input folder first!")
@@ -845,6 +870,9 @@ class MarketplaceXWidget(QWidget):
             self.download_button.setEnabled(False)
             self.compare_button.setEnabled(False)
             
+            # Set hash difference threshold
+            HASH_THRESHOLD = 10  # Lower number means more similar
+            
             total_processed = 0
             for img_path in input_images:
                 # Extract filename and SVS
@@ -861,39 +889,67 @@ class MarketplaceXWidget(QWidget):
                 color_match = re.search(r'_([A-Za-z0-9]+)', filename)
                 color = color_match.group(1) if color_match else ""
                 
-                # Find any matching downloaded files with the same SVS
-                found_match = False
-                best_match = "No match"
-                
+                # Find matching downloaded files with the same SVS
+                matching_downloads = []
                 for downloaded_file in os.listdir(download_folder):
                     if downloaded_file.startswith(svs):
-                        found_match = True
-                        best_match = downloaded_file
-                        break
+                        matching_downloads.append(downloaded_file)
                 
-                # Simple SVS-based comparison
-                if found_match:
-                    status = "Duplicate"
-                else:
-                    status = "For Retouch"
-                    # Copy to retouch folder
-                    try:
-                        dest_path = os.path.join(retouch_folder, filename)
-                        shutil.copy2(img_path, dest_path)
-                        self.add_log(f"Copied {filename} to retouch folder")
-                    except Exception as e:
-                        self.add_log(f"Error copying file to retouch folder: {str(e)}")
-                
+                # Initialize result
                 result = {
                     "Input_Image": filename,
                     "SVS": svs,
                     "Color": color,
-                    "Best_Match": best_match,
-                    "Status": status
+                    "Best_Match": "No match",
+                    "Status": "For Retouch",
+                    "Hash_Difference": None,
+                    "Downloaded_Path": "",
+                    "Matching_Path": img_path,
+                    "Match_Type": "SVS number match"
                 }
                 
+                # If we found matching SVS files, perform hash comparison
+                if matching_downloads:
+                    best_hash_diff = float('inf')
+                    best_match = ""
+                    best_match_path = ""
+                    
+                    for downloaded_file in matching_downloads:
+                        downloaded_path = os.path.join(download_folder, downloaded_file)
+                        hash_diff = self.compare_image_hashes(img_path, downloaded_path)
+                        
+                        if hash_diff is not None and hash_diff < best_hash_diff:
+                            best_hash_diff = hash_diff
+                            best_match = downloaded_file
+                            best_match_path = downloaded_path
+                    
+                    result["Best_Match"] = best_match
+                    result["Hash_Difference"] = best_hash_diff
+                    result["Downloaded_Path"] = best_match_path
+                    
+                    # Only mark as duplicate if hash difference is below threshold
+                    if best_hash_diff <= HASH_THRESHOLD:
+                        result["Status"] = "Duplicate"
+                        result["Match_Type"] = "SVS number match"
+                        self.add_log(f"Found duplicate: {filename} matches {best_match} (hash diff: {best_hash_diff})")
+                    else:
+                        # Copy to retouch folder if hash difference is above threshold
+                        try:
+                            dest_path = os.path.join(retouch_folder, filename)
+                            shutil.copy2(img_path, dest_path)
+                            self.add_log(f"Copied {filename} to retouch folder (hash diff: {best_hash_diff})")
+                        except Exception as e:
+                            self.add_log(f"Error copying file to retouch folder: {str(e)}")
+                else:
+                    # No matching SVS found, copy to retouch folder
+                    try:
+                        dest_path = os.path.join(retouch_folder, filename)
+                        shutil.copy2(img_path, dest_path)
+                        self.add_log(f"Copied {filename} to retouch folder (no matching SVS)")
+                    except Exception as e:
+                        self.add_log(f"Error copying file to retouch folder: {str(e)}")
+                
                 comparison_results.append(result)
-                self.add_log(f"Compared {filename}: {status}")
                 
                 # Update progress
                 total_processed += 1
@@ -1036,3 +1092,23 @@ class MarketplaceXWidget(QWidget):
     def update_progress(self, value):
         """Update progress bar"""
         self.progress_bar.setValue(value)
+    
+    def compare_image_hashes(self, img1_path, img2_path):
+        """Compare two images using perceptual hashing"""
+        try:
+            # Open images
+            img1 = Image.open(img1_path)
+            img2 = Image.open(img2_path)
+            
+            # Calculate perceptual hashes
+            hash1 = imagehash.average_hash(img1)
+            hash2 = imagehash.average_hash(img2)
+            
+            # Calculate hash difference
+            hash_diff = hash1 - hash2
+            
+            return hash_diff
+        
+        except Exception as e:
+            self.add_log(f"Error in hash comparison: {str(e)}")
+            return None
