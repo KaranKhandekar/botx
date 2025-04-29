@@ -269,36 +269,21 @@ class ImageComparisonThread(QThread):
             if img1.shape != img2.shape:
                 self.log_message.emit(f"Image sizes differ: {img1.shape} vs {img2.shape}")
             
-            # 2. Calculate color histograms with mask to reduce shadow impact
-            # Create masks to focus on non-dark regions (reduce shadow impact)
-            mask1 = cv2.cvtColor(img1_rgb, cv2.COLOR_RGB2GRAY) > 30  # Ignore very dark pixels
-            mask2 = cv2.cvtColor(img2_rgb, cv2.COLOR_RGB2GRAY) > 30
-            
-            hist1 = cv2.calcHist([img1_rgb], [0, 1, 2], mask1.astype(np.uint8), [8, 8, 8], [0, 256, 0, 256, 0, 256])
-            hist2 = cv2.calcHist([img2_rgb], [0, 1, 2], mask2.astype(np.uint8), [8, 8, 8], [0, 256, 0, 256, 0, 256])
-            
-            # Normalize histograms
-            hist1 = cv2.normalize(hist1, hist1).flatten()
-            hist2 = cv2.normalize(hist2, hist2).flatten()
-            
-            # Calculate histogram difference
-            hist_diff = cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
-            
-            # 3. Feature detection and matching
+            # 2. Feature detection and matching (do this first as it's more important)
             # Convert to grayscale and enhance contrast for better feature detection
             gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
             gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
             
             # Apply contrast enhancement
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
             gray1 = clahe.apply(gray1)
             gray2 = clahe.apply(gray2)
             
-            # Initialize SIFT detector with adjusted parameters
+            # Initialize SIFT detector
             sift = cv2.SIFT_create(
                 nfeatures=0,  # Unlimited features
-                contrastThreshold=0.02,  # Lower for more features
-                edgeThreshold=20  # Higher to allow more edge features
+                contrastThreshold=0.02,  # Less selective to catch more features
+                edgeThreshold=20  # Less selective to catch more features
             )
             
             # Find keypoints and descriptors
@@ -308,32 +293,76 @@ class ImageComparisonThread(QThread):
             if descriptors1 is None or descriptors2 is None:
                 return None, "No features found in one or both images"
             
-            # Feature matching with adjusted ratio test
+            # Feature matching
             bf = cv2.BFMatcher()
             matches = bf.knnMatch(descriptors1, descriptors2, k=2)
             
-            # Apply ratio test with more lenient threshold
+            # Apply ratio test
             good_matches = []
             for m, n in matches:
-                if m.distance < 0.85 * n.distance:  # More lenient ratio test
+                if m.distance < 0.75 * n.distance:  # Stricter ratio test
                     good_matches.append(m)
             
-            # Calculate matching score with minimum threshold
+            # Calculate matching score
             match_score = len(good_matches) / min(len(keypoints1), len(keypoints2))
-            match_score = max(match_score, 0.1)  # Ensure minimum match score
             
-            # Combine scores with adjusted weights
-            # Give more weight to feature matching and less to color
-            hist_score = (hist_diff + 1) / 2
-            final_score = (hist_score * 0.3 + match_score * 0.7) * 100  # More weight to features
+            # If we have a very high match score, it's likely a duplicate regardless of color
+            if match_score > 0.5:  # 50% feature match is very good
+                return 100, "High feature match - likely duplicate"
             
-            # More lenient thresholds for difference detection
-            if match_score < 0.15:  # More lenient feature threshold
-                return final_score, "Significant product differences detected"
-            elif hist_score < 0.3:  # More lenient color threshold
-                return final_score, "Significant color differences detected"
-            else:
+            # For lower match scores, check color and distribution
+            if len(good_matches) > 5:  # Need minimum matches for distribution analysis
+                # Get matched keypoints
+                src_pts = np.float32([keypoints1[m.queryIdx].pt for m in good_matches]).reshape(-1, 2)
+                dst_pts = np.float32([keypoints2[m.trainIdx].pt for m in good_matches]).reshape(-1, 2)
+                
+                # Calculate distances between matched points
+                distances = np.sqrt(np.sum((src_pts - dst_pts) ** 2, axis=1))
+                
+                # If maximum distance is small, images are very similar
+                max_distance = np.max(distances)
+                if max_distance < 30:  # Pixels
+                    return 95, "Very small feature differences"
+                
+                # Check if changes are uniform
+                dist_std = np.std(distances)
+                if dist_std > 100:  # High variation in distances
+                    return 50, "Non-uniform differences detected"
+            
+            # 3. Color comparison only if feature matching wasn't conclusive
+            # Create center mask (focus on middle 90% of image)
+            h1, w1 = img1_rgb.shape[:2]
+            center_mask = np.zeros((h1, w1), dtype=np.uint8)
+            
+            # Define center region
+            cy, cx = h1//2, w1//2
+            size = min(h1, w1)
+            radius = int(size * 0.45)  # 90% of image
+            
+            cv2.circle(center_mask, (cx, cy), radius, 255, -1)
+            
+            # Calculate histograms focusing on center region
+            hist1 = cv2.calcHist([img1_rgb], [0, 1, 2], center_mask, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+            hist2 = cv2.calcHist([img2_rgb], [0, 1, 2], center_mask, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+            
+            # Normalize histograms
+            hist1 = cv2.normalize(hist1, hist1).flatten()
+            hist2 = cv2.normalize(hist2, hist2).flatten()
+            
+            # Calculate histogram difference
+            hist_diff = cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
+            hist_score = (hist_diff + 1) / 2  # Convert to 0-1 scale
+            
+            # Final decision based on both feature matching and color
+            final_score = match_score * 90 + hist_score * 10  # Heavily weight features
+            final_score = min(final_score * 100, 100)  # Convert to percentage
+            
+            if final_score >= 60:  # Lower threshold for considering images similar
                 return final_score, "Images are similar"
+            elif match_score > 0.3:  # Good feature match but color differs
+                return final_score, "Similar features but color differences"
+            else:
+                return final_score, "Significant differences detected"
             
         except Exception as e:
             self.log_message.emit(f"Error in detailed comparison: {str(e)}")
@@ -464,13 +493,18 @@ class ImageComparisonThread(QThread):
                     result["Downloaded_Path"] = best_match_path
                     result["Comparison_Reason"] = comparison_reason
                     
-                    # Only mark as duplicate if similarity is high AND no significant differences detected
-                    if best_similarity >= 80 and "differences detected" not in comparison_reason.lower():
+                    # Mark as duplicate only if:
+                    # 1. Similarity score is high enough (>70)
+                    # 2. No significant differences detected
+                    # 3. Reason indicates images are similar
+                    if (best_similarity >= 70 and 
+                        "differences" not in comparison_reason.lower() and 
+                        "not enough" not in comparison_reason.lower()):
                         result["Status"] = "Duplicate"
                         result["Match_Type"] = "Product match"
                         self.add_log(f"Found duplicate: {filename} matches {best_match} (similarity: {best_similarity:.2f}%)")
                     else:
-                        # Copy to retouch folder if similarity is low or differences detected
+                        # Copy to retouch folder if any differences detected
                         try:
                             dest_path = os.path.join(retouch_folder, filename)
                             shutil.copy2(img_path, dest_path)
@@ -1082,13 +1116,18 @@ class MarketplaceXWidget(QWidget):
                     result["Downloaded_Path"] = best_match_path
                     result["Comparison_Reason"] = comparison_reason
                     
-                    # Only mark as duplicate if similarity is high AND no significant differences detected
-                    if best_similarity >= 80 and "differences detected" not in comparison_reason.lower():
+                    # Mark as duplicate only if:
+                    # 1. Similarity score is high enough (>70)
+                    # 2. No significant differences detected
+                    # 3. Reason indicates images are similar
+                    if (best_similarity >= 70 and 
+                        "differences" not in comparison_reason.lower() and 
+                        "not enough" not in comparison_reason.lower()):
                         result["Status"] = "Duplicate"
                         result["Match_Type"] = "Product match"
                         self.add_log(f"Found duplicate: {filename} matches {best_match} (similarity: {best_similarity:.2f}%)")
                     else:
-                        # Copy to retouch folder if similarity is low or differences detected
+                        # Copy to retouch folder if any differences detected
                         try:
                             dest_path = os.path.join(retouch_folder, filename)
                             shutil.copy2(img_path, dest_path)
@@ -1272,36 +1311,21 @@ class MarketplaceXWidget(QWidget):
             if img1.shape != img2.shape:
                 self.add_log(f"Image sizes differ: {img1.shape} vs {img2.shape}")
             
-            # 2. Calculate color histograms with mask to reduce shadow impact
-            # Create masks to focus on non-dark regions (reduce shadow impact)
-            mask1 = cv2.cvtColor(img1_rgb, cv2.COLOR_RGB2GRAY) > 30  # Ignore very dark pixels
-            mask2 = cv2.cvtColor(img2_rgb, cv2.COLOR_RGB2GRAY) > 30
-            
-            hist1 = cv2.calcHist([img1_rgb], [0, 1, 2], mask1.astype(np.uint8), [8, 8, 8], [0, 256, 0, 256, 0, 256])
-            hist2 = cv2.calcHist([img2_rgb], [0, 1, 2], mask2.astype(np.uint8), [8, 8, 8], [0, 256, 0, 256, 0, 256])
-            
-            # Normalize histograms
-            hist1 = cv2.normalize(hist1, hist1).flatten()
-            hist2 = cv2.normalize(hist2, hist2).flatten()
-            
-            # Calculate histogram difference
-            hist_diff = cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
-            
-            # 3. Feature detection and matching
+            # 2. Feature detection and matching (do this first as it's more important)
             # Convert to grayscale and enhance contrast for better feature detection
             gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
             gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
             
             # Apply contrast enhancement
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
             gray1 = clahe.apply(gray1)
             gray2 = clahe.apply(gray2)
             
-            # Initialize SIFT detector with adjusted parameters
+            # Initialize SIFT detector
             sift = cv2.SIFT_create(
                 nfeatures=0,  # Unlimited features
-                contrastThreshold=0.02,  # Lower for more features
-                edgeThreshold=20  # Higher to allow more edge features
+                contrastThreshold=0.02,  # Less selective to catch more features
+                edgeThreshold=20  # Less selective to catch more features
             )
             
             # Find keypoints and descriptors
@@ -1311,32 +1335,76 @@ class MarketplaceXWidget(QWidget):
             if descriptors1 is None or descriptors2 is None:
                 return None, "No features found in one or both images"
             
-            # Feature matching with adjusted ratio test
+            # Feature matching
             bf = cv2.BFMatcher()
             matches = bf.knnMatch(descriptors1, descriptors2, k=2)
             
-            # Apply ratio test with more lenient threshold
+            # Apply ratio test
             good_matches = []
             for m, n in matches:
-                if m.distance < 0.85 * n.distance:  # More lenient ratio test
+                if m.distance < 0.75 * n.distance:  # Stricter ratio test
                     good_matches.append(m)
             
-            # Calculate matching score with minimum threshold
+            # Calculate matching score
             match_score = len(good_matches) / min(len(keypoints1), len(keypoints2))
-            match_score = max(match_score, 0.1)  # Ensure minimum match score
             
-            # Combine scores with adjusted weights
-            # Give more weight to feature matching and less to color
-            hist_score = (hist_diff + 1) / 2
-            final_score = (hist_score * 0.3 + match_score * 0.7) * 100  # More weight to features
+            # If we have a very high match score, it's likely a duplicate regardless of color
+            if match_score > 0.5:  # 50% feature match is very good
+                return 100, "High feature match - likely duplicate"
             
-            # More lenient thresholds for difference detection
-            if match_score < 0.15:  # More lenient feature threshold
-                return final_score, "Significant product differences detected"
-            elif hist_score < 0.3:  # More lenient color threshold
-                return final_score, "Significant color differences detected"
-            else:
+            # For lower match scores, check color and distribution
+            if len(good_matches) > 5:  # Need minimum matches for distribution analysis
+                # Get matched keypoints
+                src_pts = np.float32([keypoints1[m.queryIdx].pt for m in good_matches]).reshape(-1, 2)
+                dst_pts = np.float32([keypoints2[m.trainIdx].pt for m in good_matches]).reshape(-1, 2)
+                
+                # Calculate distances between matched points
+                distances = np.sqrt(np.sum((src_pts - dst_pts) ** 2, axis=1))
+                
+                # If maximum distance is small, images are very similar
+                max_distance = np.max(distances)
+                if max_distance < 30:  # Pixels
+                    return 95, "Very small feature differences"
+                
+                # Check if changes are uniform
+                dist_std = np.std(distances)
+                if dist_std > 100:  # High variation in distances
+                    return 50, "Non-uniform differences detected"
+            
+            # 3. Color comparison only if feature matching wasn't conclusive
+            # Create center mask (focus on middle 90% of image)
+            h1, w1 = img1_rgb.shape[:2]
+            center_mask = np.zeros((h1, w1), dtype=np.uint8)
+            
+            # Define center region
+            cy, cx = h1//2, w1//2
+            size = min(h1, w1)
+            radius = int(size * 0.45)  # 90% of image
+            
+            cv2.circle(center_mask, (cx, cy), radius, 255, -1)
+            
+            # Calculate histograms focusing on center region
+            hist1 = cv2.calcHist([img1_rgb], [0, 1, 2], center_mask, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+            hist2 = cv2.calcHist([img2_rgb], [0, 1, 2], center_mask, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+            
+            # Normalize histograms
+            hist1 = cv2.normalize(hist1, hist1).flatten()
+            hist2 = cv2.normalize(hist2, hist2).flatten()
+            
+            # Calculate histogram difference
+            hist_diff = cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
+            hist_score = (hist_diff + 1) / 2  # Convert to 0-1 scale
+            
+            # Final decision based on both feature matching and color
+            final_score = match_score * 90 + hist_score * 10  # Heavily weight features
+            final_score = min(final_score * 100, 100)  # Convert to percentage
+            
+            if final_score >= 60:  # Lower threshold for considering images similar
                 return final_score, "Images are similar"
+            elif match_score > 0.3:  # Good feature match but color differs
+                return final_score, "Similar features but color differences"
+            else:
+                return final_score, "Significant differences detected"
             
         except Exception as e:
             self.add_log(f"Error in detailed comparison: {str(e)}")
