@@ -245,6 +245,88 @@ class ImageComparisonThread(QThread):
             self.log_message.emit(f"Error in hash comparison: {str(e)}")
             return None
     
+    def compare_images_detailed(self, img1_path, img2_path):
+        """
+        Detailed image comparison that considers:
+        1. Overall image structure
+        2. Color distribution
+        3. Feature detection for product details
+        """
+        try:
+            # Read images
+            img1 = cv2.imread(img1_path)
+            img2 = cv2.imread(img2_path)
+            
+            if img1 is None or img2 is None:
+                self.log_message.emit(f"Error reading images")
+                return None, "Error reading images"
+            
+            # Convert to RGB for better color analysis
+            img1_rgb = cv2.cvtColor(img1, cv2.COLOR_BGR2RGB)
+            img2_rgb = cv2.cvtColor(img2, cv2.COLOR_BGR2RGB)
+            
+            # 1. Basic size check
+            if img1.shape != img2.shape:
+                self.log_message.emit(f"Image sizes differ: {img1.shape} vs {img2.shape}")
+            
+            # 2. Calculate color histograms
+            hist1 = cv2.calcHist([img1_rgb], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+            hist2 = cv2.calcHist([img2_rgb], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+            
+            # Normalize histograms
+            hist1 = cv2.normalize(hist1, hist1).flatten()
+            hist2 = cv2.normalize(hist2, hist2).flatten()
+            
+            # Calculate histogram difference
+            hist_diff = cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
+            
+            # 3. Feature detection and matching
+            # Convert to grayscale for feature detection
+            gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+            gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+            
+            # Initialize SIFT detector
+            sift = cv2.SIFT_create()
+            
+            # Find keypoints and descriptors
+            keypoints1, descriptors1 = sift.detectAndCompute(gray1, None)
+            keypoints2, descriptors2 = sift.detectAndCompute(gray2, None)
+            
+            if descriptors1 is None or descriptors2 is None:
+                return None, "No features found in one or both images"
+            
+            # Feature matching
+            bf = cv2.BFMatcher()
+            matches = bf.knnMatch(descriptors1, descriptors2, k=2)
+            
+            # Apply ratio test
+            good_matches = []
+            for m, n in matches:
+                if m.distance < 0.75 * n.distance:
+                    good_matches.append(m)
+            
+            # Calculate matching score
+            match_score = len(good_matches) / min(len(keypoints1), len(keypoints2))
+            
+            # Combine scores
+            # hist_diff ranges from -1 to 1, convert to 0-1 scale
+            hist_score = (hist_diff + 1) / 2
+            
+            # Calculate final similarity score (0-100)
+            final_score = (hist_score * 0.4 + match_score * 0.6) * 100
+            
+            # Determine if images are significantly different
+            if match_score < 0.2:  # Very few feature matches
+                return final_score, "Significant product differences detected"
+            elif hist_score < 0.5:  # Major color differences
+                return final_score, "Significant color differences detected"
+            else:
+                return final_score, "Images are similar"
+            
+        except Exception as e:
+            self.log_message.emit(f"Error in detailed comparison: {str(e)}")
+            return None, f"Error: {str(e)}"
+    
     def run(self):
         """Run the comparison task"""
         try:
@@ -319,32 +401,80 @@ class ImageComparisonThread(QThread):
                 color_match = re.search(r'_([A-Za-z0-9]+)', filename)
                 color = color_match.group(1) if color_match else ""
                 
-                # Check if SVS exists in downloaded files
-                if svs in svs_to_downloaded:
-                    status = "Duplicate"
-                    matching_downloads = svs_to_downloaded[svs]
-                    best_match = matching_downloads[0] if matching_downloads else "No match"
-                else:
-                    status = "For Retouch"
-                    best_match = "No match"
-                    # Copy to retouch folder
-                    try:
-                        dest_path = os.path.join(retouch_folder, filename)
-                        shutil.copy2(img_path, dest_path)
-                        self.add_log(f"Copied {filename} to retouch folder")
-                    except Exception as e:
-                        self.add_log(f"Error copying file to retouch folder: {str(e)}")
+                # Find matching downloaded files with the same SVS and color
+                matching_downloads = []
+                for downloaded_file in os.listdir(download_folder):
+                    # Check if file starts with SVS
+                    if downloaded_file.startswith(svs):
+                        # Extract color from downloaded filename
+                        downloaded_color_match = re.search(r'_([A-Za-z0-9]+)', downloaded_file)
+                        downloaded_color = downloaded_color_match.group(1) if downloaded_color_match else ""
+                        
+                        # Only add to matches if colors match (or both have no color)
+                        if color == downloaded_color:
+                            matching_downloads.append(downloaded_file)
+                            self.add_log(f"Found matching SVS and color: {downloaded_file} matches color {color}")
+                        else:
+                            self.add_log(f"SVS matches but color differs - Input: {color}, Downloaded: {downloaded_color}")
                 
+                # Initialize result
                 result = {
                     "Input_Image": filename,
                     "SVS": svs,
                     "Color": color,
-                    "Best_Match": best_match,
-                    "Status": status
+                    "Best_Match": "No match",
+                    "Status": "For Retouch",
+                    "Hash_Difference": None,
+                    "Downloaded_Path": "",
+                    "Matching_Path": img_path,
+                    "Match_Type": "No match"
                 }
                 
+                # If we found matching SVS files, perform detailed comparison
+                if matching_downloads:
+                    best_similarity = 0
+                    best_match = ""
+                    best_match_path = ""
+                    comparison_reason = ""
+                    
+                    for downloaded_file in matching_downloads:
+                        downloaded_path = os.path.join(download_folder, downloaded_file)
+                        similarity_score, reason = self.compare_images_detailed(img_path, downloaded_path)
+                        
+                        if similarity_score is not None and similarity_score > best_similarity:
+                            best_similarity = similarity_score
+                            best_match = downloaded_file
+                            best_match_path = downloaded_path
+                            comparison_reason = reason
+                    
+                    result["Best_Match"] = best_match
+                    result["Similarity_Score"] = best_similarity
+                    result["Downloaded_Path"] = best_match_path
+                    result["Comparison_Reason"] = comparison_reason
+                    
+                    # Only mark as duplicate if similarity is high AND no significant differences detected
+                    if best_similarity >= 80 and "differences detected" not in comparison_reason.lower():
+                        result["Status"] = "Duplicate"
+                        result["Match_Type"] = "Product match"
+                        self.add_log(f"Found duplicate: {filename} matches {best_match} (similarity: {best_similarity:.2f}%)")
+                    else:
+                        # Copy to retouch folder if similarity is low or differences detected
+                        try:
+                            dest_path = os.path.join(retouch_folder, filename)
+                            shutil.copy2(img_path, dest_path)
+                            self.add_log(f"Copied {filename} to retouch folder (similarity: {best_similarity:.2f}%, reason: {comparison_reason})")
+                        except Exception as e:
+                            self.add_log(f"Error copying file to retouch folder: {str(e)}")
+                else:
+                    # No matching SVS found, copy to retouch folder
+                    try:
+                        dest_path = os.path.join(retouch_folder, filename)
+                        shutil.copy2(img_path, dest_path)
+                        self.add_log(f"Copied {filename} to retouch folder (no matching SVS)")
+                    except Exception as e:
+                        self.add_log(f"Error copying file to retouch folder: {str(e)}")
+                
                 comparison_results.append(result)
-                self.add_log(f"Compared {filename}: {status}")
                 
                 # Update progress
                 total_processed += 1
@@ -889,11 +1019,21 @@ class MarketplaceXWidget(QWidget):
                 color_match = re.search(r'_([A-Za-z0-9]+)', filename)
                 color = color_match.group(1) if color_match else ""
                 
-                # Find matching downloaded files with the same SVS
+                # Find matching downloaded files with the same SVS and color
                 matching_downloads = []
                 for downloaded_file in os.listdir(download_folder):
+                    # Check if file starts with SVS
                     if downloaded_file.startswith(svs):
-                        matching_downloads.append(downloaded_file)
+                        # Extract color from downloaded filename
+                        downloaded_color_match = re.search(r'_([A-Za-z0-9]+)', downloaded_file)
+                        downloaded_color = downloaded_color_match.group(1) if downloaded_color_match else ""
+                        
+                        # Only add to matches if colors match (or both have no color)
+                        if color == downloaded_color:
+                            matching_downloads.append(downloaded_file)
+                            self.add_log(f"Found matching SVS and color: {downloaded_file} matches color {color}")
+                        else:
+                            self.add_log(f"SVS matches but color differs - Input: {color}, Downloaded: {downloaded_color}")
                 
                 # Initialize result
                 result = {
@@ -905,39 +1045,42 @@ class MarketplaceXWidget(QWidget):
                     "Hash_Difference": None,
                     "Downloaded_Path": "",
                     "Matching_Path": img_path,
-                    "Match_Type": "SVS number match"
+                    "Match_Type": "No match"
                 }
                 
-                # If we found matching SVS files, perform hash comparison
+                # If we found matching SVS files, perform detailed comparison
                 if matching_downloads:
-                    best_hash_diff = float('inf')
+                    best_similarity = 0
                     best_match = ""
                     best_match_path = ""
+                    comparison_reason = ""
                     
                     for downloaded_file in matching_downloads:
                         downloaded_path = os.path.join(download_folder, downloaded_file)
-                        hash_diff = self.compare_image_hashes(img_path, downloaded_path)
+                        similarity_score, reason = self.compare_images_detailed(img_path, downloaded_path)
                         
-                        if hash_diff is not None and hash_diff < best_hash_diff:
-                            best_hash_diff = hash_diff
+                        if similarity_score is not None and similarity_score > best_similarity:
+                            best_similarity = similarity_score
                             best_match = downloaded_file
                             best_match_path = downloaded_path
+                            comparison_reason = reason
                     
                     result["Best_Match"] = best_match
-                    result["Hash_Difference"] = best_hash_diff
+                    result["Similarity_Score"] = best_similarity
                     result["Downloaded_Path"] = best_match_path
+                    result["Comparison_Reason"] = comparison_reason
                     
-                    # Only mark as duplicate if hash difference is below threshold
-                    if best_hash_diff <= HASH_THRESHOLD:
+                    # Only mark as duplicate if similarity is high AND no significant differences detected
+                    if best_similarity >= 80 and "differences detected" not in comparison_reason.lower():
                         result["Status"] = "Duplicate"
-                        result["Match_Type"] = "SVS number match"
-                        self.add_log(f"Found duplicate: {filename} matches {best_match} (hash diff: {best_hash_diff})")
+                        result["Match_Type"] = "Product match"
+                        self.add_log(f"Found duplicate: {filename} matches {best_match} (similarity: {best_similarity:.2f}%)")
                     else:
-                        # Copy to retouch folder if hash difference is above threshold
+                        # Copy to retouch folder if similarity is low or differences detected
                         try:
                             dest_path = os.path.join(retouch_folder, filename)
                             shutil.copy2(img_path, dest_path)
-                            self.add_log(f"Copied {filename} to retouch folder (hash diff: {best_hash_diff})")
+                            self.add_log(f"Copied {filename} to retouch folder (similarity: {best_similarity:.2f}%, reason: {comparison_reason})")
                         except Exception as e:
                             self.add_log(f"Error copying file to retouch folder: {str(e)}")
                 else:
@@ -1093,22 +1236,84 @@ class MarketplaceXWidget(QWidget):
         """Update progress bar"""
         self.progress_bar.setValue(value)
     
-    def compare_image_hashes(self, img1_path, img2_path):
-        """Compare two images using perceptual hashing"""
+    def compare_images_detailed(self, img1_path, img2_path):
+        """
+        Detailed image comparison that considers:
+        1. Overall image structure
+        2. Color distribution
+        3. Feature detection for product details
+        """
         try:
-            # Open images
-            img1 = Image.open(img1_path)
-            img2 = Image.open(img2_path)
+            # Read images
+            img1 = cv2.imread(img1_path)
+            img2 = cv2.imread(img2_path)
             
-            # Calculate perceptual hashes
-            hash1 = imagehash.average_hash(img1)
-            hash2 = imagehash.average_hash(img2)
+            if img1 is None or img2 is None:
+                self.add_log(f"Error reading images")
+                return None, "Error reading images"
             
-            # Calculate hash difference
-            hash_diff = hash1 - hash2
+            # Convert to RGB for better color analysis
+            img1_rgb = cv2.cvtColor(img1, cv2.COLOR_BGR2RGB)
+            img2_rgb = cv2.cvtColor(img2, cv2.COLOR_BGR2RGB)
             
-            return hash_diff
-        
+            # 1. Basic size check
+            if img1.shape != img2.shape:
+                self.add_log(f"Image sizes differ: {img1.shape} vs {img2.shape}")
+            
+            # 2. Calculate color histograms
+            hist1 = cv2.calcHist([img1_rgb], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+            hist2 = cv2.calcHist([img2_rgb], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+            
+            # Normalize histograms
+            hist1 = cv2.normalize(hist1, hist1).flatten()
+            hist2 = cv2.normalize(hist2, hist2).flatten()
+            
+            # Calculate histogram difference
+            hist_diff = cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
+            
+            # 3. Feature detection and matching
+            # Convert to grayscale for feature detection
+            gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+            gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+            
+            # Initialize SIFT detector
+            sift = cv2.SIFT_create()
+            
+            # Find keypoints and descriptors
+            keypoints1, descriptors1 = sift.detectAndCompute(gray1, None)
+            keypoints2, descriptors2 = sift.detectAndCompute(gray2, None)
+            
+            if descriptors1 is None or descriptors2 is None:
+                return None, "No features found in one or both images"
+            
+            # Feature matching
+            bf = cv2.BFMatcher()
+            matches = bf.knnMatch(descriptors1, descriptors2, k=2)
+            
+            # Apply ratio test
+            good_matches = []
+            for m, n in matches:
+                if m.distance < 0.75 * n.distance:
+                    good_matches.append(m)
+            
+            # Calculate matching score
+            match_score = len(good_matches) / min(len(keypoints1), len(keypoints2))
+            
+            # Combine scores
+            # hist_diff ranges from -1 to 1, convert to 0-1 scale
+            hist_score = (hist_diff + 1) / 2
+            
+            # Calculate final similarity score (0-100)
+            final_score = (hist_score * 0.4 + match_score * 0.6) * 100
+            
+            # Determine if images are significantly different
+            if match_score < 0.2:  # Very few feature matches
+                return final_score, "Significant product differences detected"
+            elif hist_score < 0.5:  # Major color differences
+                return final_score, "Significant color differences detected"
+            else:
+                return final_score, "Images are similar"
+            
         except Exception as e:
-            self.add_log(f"Error in hash comparison: {str(e)}")
-            return None
+            self.add_log(f"Error in detailed comparison: {str(e)}")
+            return None, f"Error: {str(e)}"
