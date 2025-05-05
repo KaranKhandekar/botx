@@ -247,133 +247,97 @@ class ImageComparisonThread(QThread):
     
     def compare_images_detailed(self, img1_path, img2_path):
         """
-        Detailed image comparison that considers:
-        1. Overall image structure
-        2. Color distribution
-        3. Feature detection for product details
+        Strict product image comparison:
+        - Resize both images to the same size
+        - Use pHash, ORB, and center crop pixel comparison
+        - Mark as Duplicate if:
+          1. Overall similarity >= 80%, or
+          2. Pixel score > 95% with reasonable pHash and ORB scores
+        - Otherwise mark as For Retouch
         """
         try:
-            # Read images
-            img1 = cv2.imread(img1_path)
-            img2 = cv2.imread(img2_path)
-            
-            if img1 is None or img2 is None:
-                self.log_message.emit(f"Error reading images")
-                return None, "Error reading images"
-            
-            # Convert to RGB for better color analysis
-            img1_rgb = cv2.cvtColor(img1, cv2.COLOR_BGR2RGB)
-            img2_rgb = cv2.cvtColor(img2, cv2.COLOR_BGR2RGB)
-            
-            # 1. Basic size check
-            if img1.shape != img2.shape:
-                self.log_message.emit(f"Image sizes differ: {img1.shape} vs {img2.shape}")
-            
-            # 2. Feature detection and matching (do this first as it's more important)
-            # Convert to grayscale and enhance contrast for better feature detection
-            gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
-            gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
-            
-            # Apply contrast enhancement
-            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-            gray1 = clahe.apply(gray1)
-            gray2 = clahe.apply(gray2)
-            
-            # Initialize SIFT detector
-            sift = cv2.SIFT_create(
-                nfeatures=0,  # Unlimited features
-                contrastThreshold=0.02,  # Less selective to catch more features
-                edgeThreshold=20  # Less selective to catch more features
-            )
-            
-            # Find keypoints and descriptors
-            keypoints1, descriptors1 = sift.detectAndCompute(gray1, None)
-            keypoints2, descriptors2 = sift.detectAndCompute(gray2, None)
-            
-            if descriptors1 is None or descriptors2 is None:
-                return None, "No features found in one or both images"
-            
-            # Feature matching
-            bf = cv2.BFMatcher()
-            matches = bf.knnMatch(descriptors1, descriptors2, k=2)
-            
-            # Apply ratio test
-            good_matches = []
-            for m, n in matches:
-                if m.distance < 0.75 * n.distance:  # Stricter ratio test
-                    good_matches.append(m)
-            
-            # Calculate matching score
-            match_score = len(good_matches) / min(len(keypoints1), len(keypoints2))
-            
-            # If we have a very high match score, it's likely a duplicate regardless of color
-            if match_score > 0.5:  # 50% feature match is very good
-                return 100, "High feature match - likely duplicate"
-            
-            # For lower match scores, check color and distribution
-            if len(good_matches) > 5:  # Need minimum matches for distribution analysis
-                # Get matched keypoints
-                src_pts = np.float32([keypoints1[m.queryIdx].pt for m in good_matches]).reshape(-1, 2)
-                dst_pts = np.float32([keypoints2[m.trainIdx].pt for m in good_matches]).reshape(-1, 2)
-                
-                # Calculate distances between matched points
-                distances = np.sqrt(np.sum((src_pts - dst_pts) ** 2, axis=1))
-                
-                # If maximum distance is small, images are very similar
-                max_distance = np.max(distances)
-                if max_distance < 30:  # Pixels
-                    return 95, "Very small feature differences"
-                
-                # Check if changes are uniform
-                dist_std = np.std(distances)
-                if dist_std > 100:  # High variation in distances
-                    return 50, "Non-uniform differences detected"
-            
-            # 3. Color comparison only if feature matching wasn't conclusive
-            # Create center mask (focus on middle 90% of image)
-            h1, w1 = img1_rgb.shape[:2]
-            center_mask = np.zeros((h1, w1), dtype=np.uint8)
-            
-            # Define center region
-            cy, cx = h1//2, w1//2
-            size = min(h1, w1)
-            radius = int(size * 0.45)  # 90% of image
-            
-            cv2.circle(center_mask, (cx, cy), radius, 255, -1)
-            
-            # Calculate histograms focusing on center region
-            hist1 = cv2.calcHist([img1_rgb], [0, 1, 2], center_mask, [8, 8, 8], [0, 256, 0, 256, 0, 256])
-            hist2 = cv2.calcHist([img2_rgb], [0, 1, 2], center_mask, [8, 8, 8], [0, 256, 0, 256, 0, 256])
-            
-            # Normalize histograms
-            hist1 = cv2.normalize(hist1, hist1).flatten()
-            hist2 = cv2.normalize(hist2, hist2).flatten()
-            
-            # Calculate histogram difference
-            hist_diff = cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
-            hist_score = (hist_diff + 1) / 2  # Convert to 0-1 scale
-            
-            # Final decision based on both feature matching and color
-            final_score = match_score * 90 + hist_score * 10  # Heavily weight features
-            final_score = min(final_score * 100, 100)  # Convert to percentage
-            
-            if final_score >= 60:  # Lower threshold for considering images similar
-                return final_score, "Images are similar"
-            elif match_score > 0.3:  # Good feature match but color differs
-                return final_score, "Similar features but color differences"
+            import imagehash
+            from PIL import Image
+            import cv2
+            import numpy as np
+
+            # Resize both images to the same size
+            size = (512, 512)
+            img1_pil = Image.open(img1_path).convert('RGB').resize(size, Image.LANCZOS)
+            img2_pil = Image.open(img2_path).convert('RGB').resize(size, Image.LANCZOS)
+
+            # 1. pHash
+            hash1 = imagehash.phash(img1_pil)
+            hash2 = imagehash.phash(img2_pil)
+            hash_diff = hash1 - hash2
+            phash_similarity = max(0, 100 - (hash_diff * 10))  # Convert hash diff to similarity percentage
+
+            # 2. ORB feature matching
+            img1 = cv2.cvtColor(np.array(img1_pil), cv2.COLOR_RGB2GRAY)
+            img2 = cv2.cvtColor(np.array(img2_pil), cv2.COLOR_RGB2GRAY)
+            orb = cv2.ORB_create(nfeatures=1000)
+            kp1, des1 = orb.detectAndCompute(img1, None)
+            kp2, des2 = orb.detectAndCompute(img2, None)
+            orb_score = 0
+            if des1 is not None and des2 is not None and len(kp1) > 0 and len(kp2) > 0:
+                bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+                matches = bf.match(des1, des2)
+                good_matches = [m for m in matches if m.distance < 60]
+                orb_score = len(good_matches) / max(len(kp1), len(kp2))
+            orb_similarity = orb_score * 100  # Convert to percentage
+
+            # 3. Center crop pixel comparison
+            arr1 = np.array(img1_pil)
+            arr2 = np.array(img2_pil)
+            center = (size[0]//2, size[1]//2)
+            crop = 128
+            crop1 = arr1[center[0]-crop//2:center[0]+crop//2, center[1]-crop//2:center[1]+crop//2]
+            crop2 = arr2[center[0]-crop//2:center[0]+crop//2, center[1]-crop//2:center[1]+crop//2]
+            pixel_diff = np.mean(np.abs(crop1.astype(float) - crop2.astype(float)))
+            pixel_score = 100 - pixel_diff / 2.55
+
+            # Check if both images are almost all white (featureless)
+            white1 = np.mean(arr1) > 245
+            white2 = np.mean(arr2) > 245
+            both_white = white1 and white2
+
+            # Calculate overall similarity score
+            if both_white:
+                # For white products, only use pHash and ORB
+                overall_similarity = (phash_similarity + orb_similarity) / 2
             else:
-                return final_score, "Significant differences detected"
-            
+                # For normal products, use all three methods
+                overall_similarity = (phash_similarity + orb_similarity + pixel_score) / 3
+
+            # Decision logic
+            is_duplicate = False
+
+            # Case 1: High overall similarity
+            if overall_similarity >= 80:
+                is_duplicate = True
+            # Case 2: High pixel score with reasonable pHash and ORB
+            elif pixel_score > 95 and hash_diff <= 18 and orb_score > 0.30:
+                is_duplicate = True
+            # Case 3: White products need both pHash and ORB to match
+            elif both_white and hash_diff <= 5 and orb_score > 0.35:
+                is_duplicate = True
+
+            if is_duplicate:
+                return 100, f'Duplicate (Similarity: {overall_similarity:.1f}%, pHash={hash_diff}, ORB={orb_score:.2f}, Pixel={pixel_score:.1f})'
+            else:
+                return int(overall_similarity), f'For Retouch (Similarity: {overall_similarity:.1f}%, pHash={hash_diff}, ORB={orb_score:.2f}, Pixel={pixel_score:.1f})'
         except Exception as e:
-            self.log_message.emit(f"Error in detailed comparison: {str(e)}")
-            return None, f"Error: {str(e)}"
+            self.log_message.emit(f'Error in robust comparison: {str(e)}')
+            return None, f'Error: {str(e)}'
     
     def run(self):
         """Run the comparison task"""
         try:
-            # Create retouch folder
+            # Create folders
             retouch_folder = os.path.join(self.output_folder, "for_retouch")
+            potential_duplicates_folder = os.path.join(self.output_folder, "potential_duplicates")
             os.makedirs(retouch_folder, exist_ok=True)
+            os.makedirs(potential_duplicates_folder, exist_ok=True)
             
             download_folder = os.path.join(self.output_folder, "download_for_check")
             if not os.path.exists(download_folder):
@@ -503,6 +467,15 @@ class ImageComparisonThread(QThread):
                         result["Status"] = "Duplicate"
                         result["Match_Type"] = "Product match"
                         self.add_log(f"Found duplicate: {filename} matches {best_match} (similarity: {best_similarity:.2f}%)")
+                    elif best_similarity >= 50:  # Potential duplicate
+                        result["Status"] = "Potential Duplicate"
+                        result["Match_Type"] = "Potential match"
+                        try:
+                            dest_path = os.path.join(potential_duplicates_folder, filename)
+                            shutil.copy2(img_path, dest_path)
+                            self.add_log(f"Copied {filename} to potential duplicates folder (similarity: {best_similarity:.2f}%, reason: {comparison_reason})")
+                        except Exception as e:
+                            self.add_log(f"Error copying file to potential duplicates folder: {str(e)}")
                     else:
                         # Copy to retouch folder if any differences detected
                         try:
@@ -553,6 +526,7 @@ class ImageComparisonThread(QThread):
                 
                 # Define color fills
                 duplicate_fill = PatternFill(start_color="92D050", end_color="92D050", fill_type="solid")  # Green
+                potential_fill = PatternFill(start_color="FFD700", end_color="FFD700", fill_type="solid")  # Yellow
                 retouch_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")    # Red
                 
                 # Find status column index
@@ -568,6 +542,8 @@ class ImageComparisonThread(QThread):
                         status = ws.cell(row=row, column=status_col).value
                         if status == "Duplicate":
                             ws.cell(row=row, column=status_col).fill = duplicate_fill
+                        elif status == "Potential Duplicate":
+                            ws.cell(row=row, column=status_col).fill = potential_fill
                         elif status == "For Retouch":
                             ws.cell(row=row, column=status_col).fill = retouch_fill
                 
@@ -584,6 +560,7 @@ class ImageComparisonThread(QThread):
             # Complete
             retouch_count = sum(1 for r in comparison_results if r["Status"] == "For Retouch")
             duplicate_count = sum(1 for r in comparison_results if r["Status"] == "Duplicate")
+            potential_count = sum(1 for r in comparison_results if r["Status"] == "Potential Duplicate")
             
             self.progress_bar.setValue(100)
             self.status_text.setText("Comparison complete")
@@ -593,7 +570,7 @@ class ImageComparisonThread(QThread):
             self.download_button.setEnabled(True)
             self.compare_button.setEnabled(True)
             
-            message = f"Comparison complete.\n\n{duplicate_count} duplicates\n{retouch_count} need retouch"
+            message = f"Comparison complete.\n\n{duplicate_count} duplicates\n{potential_count} potential duplicates\n{retouch_count} need retouch"
             QMessageBox.information(self, "Comparison Complete", message)
             
         except Exception as e:
@@ -1126,6 +1103,15 @@ class MarketplaceXWidget(QWidget):
                         result["Status"] = "Duplicate"
                         result["Match_Type"] = "Product match"
                         self.add_log(f"Found duplicate: {filename} matches {best_match} (similarity: {best_similarity:.2f}%)")
+                    elif best_similarity >= 50:  # Potential duplicate
+                        result["Status"] = "Potential Duplicate"
+                        result["Match_Type"] = "Potential match"
+                        try:
+                            dest_path = os.path.join(retouch_folder, filename)
+                            shutil.copy2(img_path, dest_path)
+                            self.add_log(f"Copied {filename} to retouch folder (similarity: {best_similarity:.2f}%, reason: {comparison_reason})")
+                        except Exception as e:
+                            self.add_log(f"Error copying file to retouch folder: {str(e)}")
                     else:
                         # Copy to retouch folder if any differences detected
                         try:
@@ -1176,6 +1162,7 @@ class MarketplaceXWidget(QWidget):
                 
                 # Define color fills
                 duplicate_fill = PatternFill(start_color="92D050", end_color="92D050", fill_type="solid")  # Green
+                potential_fill = PatternFill(start_color="FFD700", end_color="FFD700", fill_type="solid")  # Yellow
                 retouch_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")    # Red
                 
                 # Find status column index
@@ -1191,6 +1178,8 @@ class MarketplaceXWidget(QWidget):
                         status = ws.cell(row=row, column=status_col).value
                         if status == "Duplicate":
                             ws.cell(row=row, column=status_col).fill = duplicate_fill
+                        elif status == "Potential Duplicate":
+                            ws.cell(row=row, column=status_col).fill = potential_fill
                         elif status == "For Retouch":
                             ws.cell(row=row, column=status_col).fill = retouch_fill
                 
@@ -1207,6 +1196,7 @@ class MarketplaceXWidget(QWidget):
             # Complete
             retouch_count = sum(1 for r in comparison_results if r["Status"] == "For Retouch")
             duplicate_count = sum(1 for r in comparison_results if r["Status"] == "Duplicate")
+            potential_count = sum(1 for r in comparison_results if r["Status"] == "Potential Duplicate")
             
             self.progress_bar.setValue(100)
             self.status_text.setText("Comparison complete")
@@ -1216,7 +1206,7 @@ class MarketplaceXWidget(QWidget):
             self.download_button.setEnabled(True)
             self.compare_button.setEnabled(True)
             
-            message = f"Comparison complete.\n\n{duplicate_count} duplicates\n{retouch_count} need retouch"
+            message = f"Comparison complete.\n\n{duplicate_count} duplicates\n{potential_count} potential duplicates\n{retouch_count} need retouch"
             QMessageBox.information(self, "Comparison Complete", message)
             
         except Exception as e:
@@ -1289,123 +1279,85 @@ class MarketplaceXWidget(QWidget):
     
     def compare_images_detailed(self, img1_path, img2_path):
         """
-        Detailed image comparison that considers:
-        1. Overall image structure
-        2. Color distribution
-        3. Feature detection for product details
+        Strict product image comparison:
+        - Resize both images to the same size
+        - Use pHash, ORB, and center crop pixel comparison
+        - Mark as Duplicate if:
+          1. Overall similarity >= 80%, or
+          2. Pixel score > 95% with reasonable pHash and ORB scores
+        - Otherwise mark as For Retouch
         """
         try:
-            # Read images
-            img1 = cv2.imread(img1_path)
-            img2 = cv2.imread(img2_path)
-            
-            if img1 is None or img2 is None:
-                self.add_log(f"Error reading images")
-                return None, "Error reading images"
-            
-            # Convert to RGB for better color analysis
-            img1_rgb = cv2.cvtColor(img1, cv2.COLOR_BGR2RGB)
-            img2_rgb = cv2.cvtColor(img2, cv2.COLOR_BGR2RGB)
-            
-            # 1. Basic size check
-            if img1.shape != img2.shape:
-                self.add_log(f"Image sizes differ: {img1.shape} vs {img2.shape}")
-            
-            # 2. Feature detection and matching (do this first as it's more important)
-            # Convert to grayscale and enhance contrast for better feature detection
-            gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
-            gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
-            
-            # Apply contrast enhancement
-            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-            gray1 = clahe.apply(gray1)
-            gray2 = clahe.apply(gray2)
-            
-            # Initialize SIFT detector
-            sift = cv2.SIFT_create(
-                nfeatures=0,  # Unlimited features
-                contrastThreshold=0.02,  # Less selective to catch more features
-                edgeThreshold=20  # Less selective to catch more features
-            )
-            
-            # Find keypoints and descriptors
-            keypoints1, descriptors1 = sift.detectAndCompute(gray1, None)
-            keypoints2, descriptors2 = sift.detectAndCompute(gray2, None)
-            
-            if descriptors1 is None or descriptors2 is None:
-                return None, "No features found in one or both images"
-            
-            # Feature matching
-            bf = cv2.BFMatcher()
-            matches = bf.knnMatch(descriptors1, descriptors2, k=2)
-            
-            # Apply ratio test
-            good_matches = []
-            for m, n in matches:
-                if m.distance < 0.75 * n.distance:  # Stricter ratio test
-                    good_matches.append(m)
-            
-            # Calculate matching score
-            match_score = len(good_matches) / min(len(keypoints1), len(keypoints2))
-            
-            # If we have a very high match score, it's likely a duplicate regardless of color
-            if match_score > 0.5:  # 50% feature match is very good
-                return 100, "High feature match - likely duplicate"
-            
-            # For lower match scores, check color and distribution
-            if len(good_matches) > 5:  # Need minimum matches for distribution analysis
-                # Get matched keypoints
-                src_pts = np.float32([keypoints1[m.queryIdx].pt for m in good_matches]).reshape(-1, 2)
-                dst_pts = np.float32([keypoints2[m.trainIdx].pt for m in good_matches]).reshape(-1, 2)
-                
-                # Calculate distances between matched points
-                distances = np.sqrt(np.sum((src_pts - dst_pts) ** 2, axis=1))
-                
-                # If maximum distance is small, images are very similar
-                max_distance = np.max(distances)
-                if max_distance < 30:  # Pixels
-                    return 95, "Very small feature differences"
-                
-                # Check if changes are uniform
-                dist_std = np.std(distances)
-                if dist_std > 100:  # High variation in distances
-                    return 50, "Non-uniform differences detected"
-            
-            # 3. Color comparison only if feature matching wasn't conclusive
-            # Create center mask (focus on middle 90% of image)
-            h1, w1 = img1_rgb.shape[:2]
-            center_mask = np.zeros((h1, w1), dtype=np.uint8)
-            
-            # Define center region
-            cy, cx = h1//2, w1//2
-            size = min(h1, w1)
-            radius = int(size * 0.45)  # 90% of image
-            
-            cv2.circle(center_mask, (cx, cy), radius, 255, -1)
-            
-            # Calculate histograms focusing on center region
-            hist1 = cv2.calcHist([img1_rgb], [0, 1, 2], center_mask, [8, 8, 8], [0, 256, 0, 256, 0, 256])
-            hist2 = cv2.calcHist([img2_rgb], [0, 1, 2], center_mask, [8, 8, 8], [0, 256, 0, 256, 0, 256])
-            
-            # Normalize histograms
-            hist1 = cv2.normalize(hist1, hist1).flatten()
-            hist2 = cv2.normalize(hist2, hist2).flatten()
-            
-            # Calculate histogram difference
-            hist_diff = cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
-            hist_score = (hist_diff + 1) / 2  # Convert to 0-1 scale
-            
-            # Final decision based on both feature matching and color
-            final_score = match_score * 90 + hist_score * 10  # Heavily weight features
-            final_score = min(final_score * 100, 100)  # Convert to percentage
-            
-            if final_score >= 60:  # Lower threshold for considering images similar
-                return final_score, "Images are similar"
-            elif match_score > 0.3:  # Good feature match but color differs
-                return final_score, "Similar features but color differences"
+            import imagehash
+            from PIL import Image
+            import cv2
+            import numpy as np
+
+            # Resize both images to the same size
+            size = (512, 512)
+            img1_pil = Image.open(img1_path).convert('RGB').resize(size, Image.LANCZOS)
+            img2_pil = Image.open(img2_path).convert('RGB').resize(size, Image.LANCZOS)
+
+            # 1. pHash
+            hash1 = imagehash.phash(img1_pil)
+            hash2 = imagehash.phash(img2_pil)
+            hash_diff = hash1 - hash2
+            phash_similarity = max(0, 100 - (hash_diff * 10))  # Convert hash diff to similarity percentage
+
+            # 2. ORB feature matching
+            img1 = cv2.cvtColor(np.array(img1_pil), cv2.COLOR_RGB2GRAY)
+            img2 = cv2.cvtColor(np.array(img2_pil), cv2.COLOR_RGB2GRAY)
+            orb = cv2.ORB_create(nfeatures=1000)
+            kp1, des1 = orb.detectAndCompute(img1, None)
+            kp2, des2 = orb.detectAndCompute(img2, None)
+            orb_score = 0
+            if des1 is not None and des2 is not None and len(kp1) > 0 and len(kp2) > 0:
+                bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+                matches = bf.match(des1, des2)
+                good_matches = [m for m in matches if m.distance < 60]
+                orb_score = len(good_matches) / max(len(kp1), len(kp2))
+            orb_similarity = orb_score * 100  # Convert to percentage
+
+            # 3. Center crop pixel comparison
+            arr1 = np.array(img1_pil)
+            arr2 = np.array(img2_pil)
+            center = (size[0]//2, size[1]//2)
+            crop = 128
+            crop1 = arr1[center[0]-crop//2:center[0]+crop//2, center[1]-crop//2:center[1]+crop//2]
+            crop2 = arr2[center[0]-crop//2:center[0]+crop//2, center[1]-crop//2:center[1]+crop//2]
+            pixel_diff = np.mean(np.abs(crop1.astype(float) - crop2.astype(float)))
+            pixel_score = 100 - pixel_diff / 2.55
+
+            # Check if both images are almost all white (featureless)
+            white1 = np.mean(arr1) > 245
+            white2 = np.mean(arr2) > 245
+            both_white = white1 and white2
+
+            # Calculate overall similarity score
+            if both_white:
+                # For white products, only use pHash and ORB
+                overall_similarity = (phash_similarity + orb_similarity) / 2
             else:
-                return final_score, "Significant differences detected"
-            
+                # For normal products, use all three methods
+                overall_similarity = (phash_similarity + orb_similarity + pixel_score) / 3
+
+            # Decision logic
+            is_duplicate = False
+
+            # Case 1: High overall similarity
+            if overall_similarity >= 80:
+                is_duplicate = True
+            # Case 2: High pixel score with reasonable pHash and ORB
+            elif pixel_score > 95 and hash_diff <= 18 and orb_score > 0.30:
+                is_duplicate = True
+            # Case 3: White products need both pHash and ORB to match
+            elif both_white and hash_diff <= 5 and orb_score > 0.35:
+                is_duplicate = True
+
+            if is_duplicate:
+                return 100, f'Duplicate (Similarity: {overall_similarity:.1f}%, pHash={hash_diff}, ORB={orb_score:.2f}, Pixel={pixel_score:.1f})'
+            else:
+                return int(overall_similarity), f'For Retouch (Similarity: {overall_similarity:.1f}%, pHash={hash_diff}, ORB={orb_score:.2f}, Pixel={pixel_score:.1f})'
         except Exception as e:
-            self.add_log(f"Error in detailed comparison: {str(e)}")
-            return None, f"Error: {str(e)}"
+            self.add_log(f'Error in robust comparison: {str(e)}')
+            return None, f'Error: {str(e)}'
